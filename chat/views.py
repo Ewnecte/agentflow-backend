@@ -1,7 +1,7 @@
 import json
 
+from django.db.models import OuterRef, Subquery
 from django.http import JsonResponse, StreamingHttpResponse
-from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -55,6 +55,19 @@ class ConversationViewSet(viewsets.ModelViewSet):
             return ConversationListSerializer
         return ConversationDetailSerializer
 
+    def get_queryset(self):
+        """列表时用子查询预取最后一条消息，避免逐条 N+1 查询。"""
+        qs = super().get_queryset()
+        if self.action == 'list':
+            last = Message.objects.filter(conversation=OuterRef('pk')).order_by('-created_at')
+            qs = qs.annotate(
+                last_message_id=Subquery(last.values('id')[:1]),
+                last_message_role=Subquery(last.values('role')[:1]),
+                last_message_content=Subquery(last.values('content')[:1]),
+                last_message_created_at=Subquery(last.values('created_at')[:1]),
+            )
+        return qs
+
 
 @csrf_exempt
 @require_POST
@@ -79,7 +92,9 @@ def chat_stream(request):
 
     # 获取或创建会话
     if conversation_id:
-        conversation = get_object_or_404(Conversation, pk=conversation_id)
+        conversation = Conversation.objects.filter(pk=conversation_id).first()
+        if conversation is None:
+            return JsonResponse({'error': '会话不存在'}, status=404)
     else:
         conversation = Conversation.objects.create(title=_auto_title(content))
 
@@ -106,6 +121,10 @@ def chat_stream(request):
             conversation.save()
             yield format_sse('done', message_id=msg.id, conversation_id=conversation.id)
         except Exception as exc:  # noqa: BLE001 —— 任何异常都以 error 事件返回
+            # 已生成的部分内容也落库，避免历史里「只有用户消息、没有回复」的不一致
+            if buffer:
+                Message.objects.create(conversation=conversation, role='assistant', content=buffer)
+                conversation.save()
             yield format_sse('error', message=str(exc))
 
     response = StreamingHttpResponse(event_stream(), content_type='text/event-stream; charset=utf-8')
